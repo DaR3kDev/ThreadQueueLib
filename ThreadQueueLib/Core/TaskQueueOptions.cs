@@ -2,7 +2,7 @@
 
 /// <summary>
 /// Opciones de configuración para la cola de tareas.
-/// Permite ajustar el comportamiento de concurrencia, tamaño de cola y reintentos.
+/// Permite ajustar el comportamiento de concurrencia, tamaño de cola, reintentos y control de fallos.
 /// </summary>
 public class TaskQueueOptions
 {
@@ -28,4 +28,16 @@ public class TaskQueueOptions
     /// Permite dar un respiro antes de volver a ejecutar la tarea.
     /// </summary>
     public required TimeSpan RetryDelay { get; init; }
+
+    /// <summary>
+    /// Número máximo de fallos consecutivos permitidos antes de activar el circuito de protección (circuit breaker).
+    /// Si se alcanzan, el sistema dejará de procesar temporalmente nuevas tareas.
+    /// </summary>
+    public int CircuitBreakerMaxFailures { get; init; }
+
+    /// <summary>
+    /// Tiempo durante el cual el circuito permanecerá abierto (sin procesar tareas) tras alcanzar el umbral de fallos.
+    /// Ayuda a evitar sobrecarga por errores repetitivos.
+    /// </summary>
+    public TimeSpan CircuitBreakerOpenDuration { get; init; }
 }
