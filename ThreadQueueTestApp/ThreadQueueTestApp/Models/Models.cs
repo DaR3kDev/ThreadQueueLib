@@ -31,3 +31,4 @@ public class SendEmailTaskLongRunning : IQueuedTask<EmailPayload>
         CompletionSource.TrySetResult(true);
     }
 }
+
