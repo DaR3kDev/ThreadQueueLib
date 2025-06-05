@@ -1,12 +1,12 @@
 # ThreadQueueLib
 
-ThreadQueueLib es una librería en C# para la gestión eficiente y concurrente de colas de tareas genéricas con soporte para:
+ThreadQueueLib es una librería en C# para la gestión y concurrente de colas de tareas genéricas con soporte para:
 
 * Control de concurrencia (número máximo de tareas paralelas)
 * Prioridades en las tareas
 * Reintentos configurables con backoff exponencial y jitter
 * Eventos para monitoreo (inicio, éxito, error, cancelación)
-* Arquitectura limpia y extensible
+* Arquitectura limpia
 * Opcional: persistencia externa para escalabilidad (no incluida en esta versión base)
 
 ---
