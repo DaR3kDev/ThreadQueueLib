@@ -8,133 +8,156 @@ using ThreadQueueLib.Utils;
 namespace ThreadQueueLib.Core;
 
 /// <summary>
-/// Cola de tareas genérica con soporte opcional para persistencia y circuito de saturación.
+/// Cola genérica de tareas con soporte para persistencia opcional y circuito de saturación.
 /// </summary>
-public class TaskQueue<T>(TaskQueueOptions options, ITaskQueuePersistence<T>? persistence = null) : ITaskQueue<T>
+public class TaskQueue<T> : ITaskQueue<T>
 {
-    private readonly TaskQueueOptions _options = options ?? throw new ArgumentNullException(nameof(options));
-    private readonly ITaskQueuePersistence<T>? _persistence = persistence;
+    private readonly TaskQueueOptions _options;
+    private readonly ITaskQueuePersistence<T>? _persistence;
     private readonly ConcurrentQueue<QueuedTaskItem<T>> _inMemoryQueue = new();
-    private readonly SemaphoreSlim _semaphore = new(options.MaxConcurrency);
+    private readonly SemaphoreSlim _semaphore;
     private readonly List<Task> _workers = [];
     private readonly CancellationTokenSource _internalCts = new();
-    private readonly CircuitBreaker _circuitBreaker = new(options.CircuitBreakerMaxFailures, options.CircuitBreakerOpenDuration);
+    private CancellationTokenSource? _linkedCts;
+    private readonly CircuitBreaker _circuitBreaker;
     private bool _isRunning;
 
-    /// <summary>
-    /// Encola una tarea, con persistencia si está configurada.
-    /// </summary>
+    public TaskQueue(TaskQueueOptions options, ITaskQueuePersistence<T>? persistence = null)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _persistence = persistence;
+        _semaphore = new SemaphoreSlim(_options.MaxConcurrency);
+        _circuitBreaker = new CircuitBreaker(_options.CircuitBreakerMaxFailures, _options.CircuitBreakerOpenDuration);
+    }
+
     public async Task EnqueueAsync(QueuedTaskItem<T> task, CancellationToken cancellationToken = default)
     {
+        if (task is null)
+            throw new ArgumentNullException(nameof(task));
+
         if (_persistence is not null)
         {
-            await _persistence.EnqueueAsync(task);
-            TaskQueueEvents<T>.RaiseTaskEnqueued(task);
-            return;
+            await _persistence.EnqueueAsync(task).ConfigureAwait(false);
+        }
+        else
+        {
+            if (_inMemoryQueue.Count >= _options.MaxQueueSize)
+                throw new InvalidOperationException("Queue is full");
+
+            _inMemoryQueue.Enqueue(task);
         }
 
-        if (_inMemoryQueue.Count >= _options.MaxQueueSize)
-            throw new InvalidOperationException("Queue is full");
-
-        _inMemoryQueue.Enqueue(task);
         TaskQueueEvents<T>.RaiseTaskEnqueued(task);
     }
 
-    /// <summary>
-    /// Inicia los workers para procesar tareas en paralelo.
-    /// </summary>
     public void Start(CancellationToken cancellationToken = default)
     {
         if (_isRunning) return;
-        _isRunning = true;
 
-        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _internalCts.Token);
+        _isRunning = true;
+        _linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _internalCts.Token);
 
         for (int i = 0; i < _options.MaxConcurrency; i++)
-            _workers.Add(Task.Run(() => WorkerLoop(linkedCts.Token), linkedCts.Token));
+        {
+            _workers.Add(Task.Run(() => WorkerLoopAsync(_linkedCts.Token), cancellationToken));
+        }
     }
 
-    /// <summary>
-    /// Detiene la cola y espera a que terminen los workers.
-    /// </summary>
     public void Stop()
     {
+        if (!_isRunning) return;
+
         _internalCts.Cancel();
+        _linkedCts?.Cancel();
+
         try
         {
-            Task.WaitAll(_workers);
+            Task.WaitAll([.. _workers]);
         }
         catch (AggregateException ae)
         {
-            ae.Handle(ex => ex is TaskCanceledException);
+            ae.Handle(ex => ex is OperationCanceledException or TaskCanceledException);
         }
-        _isRunning = false;
+        finally
+        {
+            _isRunning = false;
+            _workers.Clear();
+            _semaphore.Dispose();
+            _internalCts.Dispose();
+            _linkedCts?.Dispose();
+        }
     }
 
-    /// <summary>
-    /// Obtiene la siguiente tarea desde persistencia o memoria.
-    /// </summary>
     private async Task<QueuedTaskItem<T>?> DequeueAsync()
     {
         if (_persistence != null)
-            return await _persistence.DequeueAsync();
+            return await _persistence.DequeueAsync().ConfigureAwait(false);
 
         _inMemoryQueue.TryDequeue(out var task);
         return task;
     }
 
-    /// <summary>
-    /// Bucle principal que ejecuta tareas.
-    /// </summary>
-    private async Task WorkerLoop(CancellationToken cancellationToken)
+    private async Task WorkerLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             if (_circuitBreaker.IsOpen)
             {
-                await Task.Delay(1000, cancellationToken);
+                await DelaySafeAsync(1000, cancellationToken);
                 continue;
             }
 
-            var taskItem = await DequeueAsync();
+            var taskItem = await DequeueAsync().ConfigureAwait(false);
+
             if (taskItem is null)
             {
-                await Task.Delay(100, cancellationToken);
+                await DelaySafeAsync(100, cancellationToken);
                 continue;
             }
 
-            await _semaphore.WaitAsync(cancellationToken);
+            await ProcessTaskAsync(taskItem, cancellationToken);
+        }
+    }
 
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    TaskQueueEvents<T>.RaiseTaskStarted(taskItem);
+    private async Task DelaySafeAsync(int milliseconds, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(milliseconds, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { }
+    }
 
-                    await RetryPolicy.ExecuteAsync(
-                        () => taskItem.Task.ExecuteAsync(taskItem.Payload, cancellationToken),
-                        _options.RetryCount,
-                        _options.RetryDelay,
-                        cancellationToken
-                    );
+    private async Task ProcessTaskAsync(QueuedTaskItem<T> taskItem, CancellationToken cancellationToken)
+    {
+        await _semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
 
-                    _circuitBreaker.OnSuccess();
-                    TaskQueueEvents<T>.RaiseTaskCompleted(taskItem);
-                }
-                catch (OperationCanceledException)
-                {
-                    TaskQueueEvents<T>.RaiseTaskCancelled(taskItem);
-                }
-                catch (Exception ex)
-                {
-                    _circuitBreaker.OnFailure();
-                    TaskQueueEvents<T>.RaiseTaskFailed(taskItem, ex);
-                }
-                finally
-                {
-                    _semaphore.Release();
-                }
-            }, cancellationToken);
+        try
+        {
+            TaskQueueEvents<T>.RaiseTaskStarted(taskItem);
+
+            await RetryPolicy.ExecuteAsync(
+                () => taskItem.Task.ExecuteAsync(taskItem.Payload, cancellationToken),
+                _options.RetryCount,
+                _options.RetryDelay,
+                cancellationToken: cancellationToken
+            ).ConfigureAwait(false);
+
+            _circuitBreaker.OnSuccess();
+            TaskQueueEvents<T>.RaiseTaskCompleted(taskItem);
+        }
+        catch (OperationCanceledException)
+        {
+            TaskQueueEvents<T>.RaiseTaskCancelled(taskItem);
+        }
+        catch (Exception ex)
+        {
+            _circuitBreaker.OnFailure();
+            TaskQueueEvents<T>.RaiseTaskFailed(taskItem, ex);
+        }
+        finally
+        {
+            _semaphore.Release();
         }
     }
 }
